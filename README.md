@@ -10,7 +10,7 @@ This project presents a data-driven approach for clustering Major League Basebal
 
 ## Repository Structure
 
-- **`CMU_Capstone.qmd`**: Main Quarto notebook that runs the full analysis pipeline—from preprocessing joint trajectories to final clustering, visualization, and predictive modeling.
+- **`mlb_swing_clustering.qmd`**: Main Quarto notebook that runs the full analysis pipeline—from preprocessing joint trajectories to final clustering, visualization, and predictive modeling.
 - **`Technical Specification.pdf`**: A formal specification document outlining assumptions, dependencies, process flow, pseudo code, and setup instructions.
 - **`Figures/`**: Output plots and visualizations (e.g., cluster embeddings, swing profiles, confusion matrices).
 - **`data/`**: Expected location for parquet files from Hawk-Eye and the derived condensed datasets.
@@ -66,7 +66,7 @@ install.packages(c("tidyverse", "randomForest", "fda", "ggplot2", "umap", "mclus
 To run the full pipeline:
 
 1. Place batter swing data (private data) in the expected `data/` directory.
-2. Open `CMU_Capstone.qmd` in RStudio.
+2. Open `mlb_swing_clustering.qmd` in RStudio.
 3. Follow the step-by-step chunk instructions, including setting paths and parameters.
 4. Outputs will include cluster labels, diagnostic plots, and classification reports.
 
