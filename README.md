@@ -2,7 +2,7 @@
 
 **Carnegie Mellon University — Master of Applied Data Science**  
 **Capstone Project | Major League Baseball**  
-[View Technical Spec PDF](./Technical%20Specification.pdf)
+[View Technical Spec PDF](./Technical%20Specification.pdf) — [View Final Report PDF](./MLB_Swing_Clustering_Report.pdf)
 
 ## Overview
 
@@ -12,8 +12,7 @@ This project presents a data-driven approach for clustering Major League Basebal
 
 - **`mlb_swing_clustering.qmd`**: Main Quarto notebook that runs the full analysis pipeline—from preprocessing joint trajectories to final clustering, visualization, and predictive modeling.
 - **`Technical Specification.pdf`**: A formal specification document outlining assumptions, dependencies, process flow, pseudo code, and setup instructions.
-- **`Figures/`**: Output plots and visualizations (e.g., cluster embeddings, swing profiles, confusion matrices).
-- **`data/`**: Expected location for parquet files from Hawk-Eye and the derived condensed datasets.
+- **`MLB_Swing_Clustering_Report.pdf`**: **Output plots and visualizations (e.g., cluster embeddings, swing profiles, confusion matrices).**The final capstone report summarizing the methodology, clustering results, and key insights for stakeholders.
 - **`README.md`**: This file.
 
 ## Setup & Dependencies
