@@ -1,0 +1,1907 @@
+## Load Required Libraries
+
+```{r}
+#| message: false
+#| warning: false
+
+# ─────────────────────────────────────────────────────
+# Load Required Libraries
+# ─────────────────────────────────────────────────────
+
+# Data I/O and Wrangling
+library(arrow)        # Read/write Parquet files
+library(dplyr)        # Data manipulation
+library(tidyr)        # Data reshaping
+library(tibble)       # Tibble-friendly outputs
+library(purrr)        # Functional programming
+library(tidyverse)    # Loads ggplot2, dplyr, tidyr, etc.
+
+# Visualization
+library(ggplot2)      # 2D plotting
+library(plotly)       # Interactive 3D plots
+library(knitr)        # Nicely formatted tables
+library(gridExtra)    # Plotting multiple plots in a grid
+
+# 📈 Functional Data Analysis
+library(fda)          # B-spline fitting and FPCA
+
+# Dimensionality Reduction & Clustering
+library(umap)         # UMAP embedding
+library(mclust)       # Gaussian Mixture Models
+library(dendextend)   # Consensus clustering visuals
+library(cluster)      # Clustering utilities
+
+# Validation
+library(randomForest) # Extract feature importance
+```
+
+## Load and Merge Swing Data
+
+This section reads in 100 batter swing files and outcome metrics, then merges the datasets for downstream analysis.
+
+-   `folder_path` is the path to where your 100 parquets are for each batter (high-frequency time series data)
+
+-   `outcomes_path` is the path to where the outcome data is (swing-level summary statistics)
+
+```{r}
+
+folder_path <-     # Path to high frequency swing data
+outcomes_path <-   # Path to swing summary data
+file_names <- paste0(folder_path, "batter-", 1:100, ".parquet")
+
+# --- Load all batter swing files ---
+batter_data <- map_dfr(file_names, read_parquet)
+
+# --- Load swing outcomes ---
+swing_outcomes <- read_parquet(outcomes_path)
+
+# --- Join outcomes to biomechanical data ---
+batter_data <- batter_data %>%
+  left_join(swing_outcomes, by = c("BatterLabel", "SwingNumber"))
+
+```
+
+## Select and Prepare Joint Variables
+
+Before analyzing biomechanical swing patterns, we first selected a subset of joints movements that captured the most informative biomechanical signals. The goal was to maximize the interpretability and reduce noise by focusing on joints whose movement patterns are most consistently structured across swings.
+
+Instead of doing joint selection and possibly losing information about full body movements, we decided to find the most informative axis among the XYZ data.
+
+### Find Maximally Informative Angles for Joint Position
+
+```{r}
+# Get ratios to normalize Y joints by height
+h_ratios <- 6 / swing_outcomes$Height[1:100*10]
+h_ratios <- h_ratios[batter_data$BatterLabel]
+
+# Set up data frame for maximally informative angles
+joint_angles <- data.frame(Joint = rep(NA, 14),
+                           X = rep(NA, 14),
+                           Y = rep(NA, 14),
+                           Z = rep(NA, 14))
+
+# Perform PCA on each joint
+for (ii in 1:14) {
+  joint <- batter_data[, (2 + ii * 3):(4 + ii * 3)]
+  joint_name <- substr(names(joint[, 1]), 1, nchar(names(joint[, 1])) - 1)
+  joint[, 2] <- joint[, 2] * h_ratios
+  jointPC <- prcomp(joint, scale = TRUE)
+  joint_angles[ii, 1] <- joint_name
+  joint_angles[ii, 2:4] <- t(jointPC$rotation[, 1])
+  batter_data[, 156 + ii] <- jointPC$x[, 1]
+  names(batter_data)[156 + ii] <- paste0(joint_name, "_infoaxis")
+}
+```
+
+To characterize each joint’s behavior, we treated its X-, Y-, and Z-coordinates collectively and applied principal component analysis (PCA) to its 3D trajectory across swings. The first principal component captured the most consistent axis of variation for each joint — representing the dominant direction of motion throughout the swing.
+
+Prior to applying PCA, we normalized Y-coordinates based on each batter’s height to account for anthropometric differences that could otherwise obscure joint movement patterns.
+
+For each joint, we retained the first principal component score as a one-dimensional functional curve, effectively reducing each joint’s trajectory to its most informative biomechanical axis.
+
+This will be the finalized set of 14 joints to use for downstream Functional Principal Component Analysis (FPCA) and clustering.
+
+### Finalize Joint Selection for FDA
+
+These are the first PCs of the 14 joints.
+
+```{r}
+
+joint_vars <- c(
+  "Hips_infoaxis",
+  "LeftAnkle_infoaxis",
+  "LeftElbow_infoaxis",
+  "LeftHip_infoaxis",
+  "LeftKnee_infoaxis",
+  "LeftShoulder_infoaxis",
+  "LeftWrist_infoaxis",
+  "MidShoulder_infoaxis",
+  "RightAnkle_infoaxis",
+  "RightElbow_infoaxis",
+  "RightKnee_infoaxis",
+  "RightHip_infoaxis",
+  "RightShoulder_infoaxis",
+  "RightWrist_infoaxis"
+)
+```
+
+## Clean and Normalize Swing Time
+
+We isolate the pre-contact swing phase, from `TimePeakGather` (when the hips begin moving forward) to `TimeCon` (estimated time of bat-ball contact), because this window captures the most biomechanically meaningful and explosive segment of the swing.
+
+To reduce variability across swings of different durations, we normalize time within this window to a common scale from 0 to 1 using a new variable, `ScaledTime`. This ensures that downstream analyses (e.g., spline fitting, FPCA) compare equivalent movement phases across hitters.
+
+One swing was missing a `TimePeakGather` value, so we imputed it using that batter’s mean TimePeakGather across other swings—preserving temporal structure while avoiding data loss.
+
+```{r}
+
+# --- Impute missing TimePeakGather using batter-specific means ---
+batter_avg_peak <- batter_data %>%
+  group_by(BatterLabel, SwingNumber) %>%
+  summarise(TimePeakGather = unique(TimePeakGather), .groups = "drop") %>%
+  group_by(BatterLabel) %>%
+  summarise(mean_peak = mean(TimePeakGather, na.rm = TRUE), .groups = "drop")
+
+batter_data <- batter_data %>%
+  left_join(batter_avg_peak, by = "BatterLabel") %>%
+  mutate(TimePeakGather = ifelse(is.na(TimePeakGather), mean_peak, TimePeakGather)) %>%
+  dplyr::select(-mean_peak)
+
+# --- Keep only frames between Peak Gather and Contact & scale time ---
+batter_data <- batter_data %>%
+  filter(JointTime >= TimePeakGather & JointTime <= TimeCon) %>%
+  group_by(BatterLabel, SwingNumber) %>%
+  mutate(ScaledTime = (JointTime - TimePeakGather) / (TimeCon - TimePeakGather)) %>%
+  ungroup()
+
+```
+
+After normalizing swing time, we subset our biomechanical data for the joints we've chosen.
+
+```{r}
+# Subset biomechanical data for selected joints
+joint_data <- batter_data %>%
+  dplyr::select(BatterLabel, SwingNumber, ScaledTime, all_of(joint_vars))
+
+# Store unique swing IDs for downstream indexing
+swing_metadata <- joint_data %>%
+  dplyr::select(BatterLabel, SwingNumber) %>%
+  distinct()
+```
+
+## Fit B-spline Functions to Joint Time Series
+
+In this step, we apply B-spline smoothing to the joint time series data for each swing. The goal is to treat each joint's motion not as a set of noisy frame-by-frame data points, but as a smooth, continuous function over time.
+
+This allows us to model the underlying movement pattern of a swing while reducing small, noisy fluctuations that are often unimportant or uninformative.
+
+### What are B-splines?
+
+B-splines, or basis splines, are a mathematical tool used for curve smoothing and interpolation. They are:
+
+-   Built from piecewise cubic polynomials (i.e., different curves stitched together smoothly),
+
+-   Designed to maintain continuity (the curve and its first two derivatives are continuous),
+
+-   Flexible enough to model motion over time without overfitting.
+
+Each swing is approximated using a set of basis functions, and we estimate a set of coefficients that tells us how much each basis function contributes to the final smoothed curve.
+
+### Why use B-splines here?
+
+Each batter’s swing is represented by time series data for many joints. But:
+
+-   This raw data is noisy, frame-by-frame, and hard to compare directly.
+
+-   Instead, we want to analyze the shape of the swing.
+
+B-splines let us express the movement of each joint as a smooth function $S(t)$ where time is aligned relative to the moment of contact. These curves can then be compared across swings and players in a principled way.
+
+### What does the B-spline equation look like?
+
+Each smoothed curve (all 1000 swings) takes the form:
+
+$$ S(t) = c_1 \times B_1(t) + c_2 \times B_2(t) + ... c_{10} \times B_{10}(t) $$
+
+where:
+
+-   $B_k(t)$ are the basis functions (cubic polynomials) in the form in the form $a_nt^3 + b_nt^2 + c_nt + d_n$
+
+-   $c_k$ are the fitted coefficients specific to that swing and joint.
+
+You can think of these $B_k(t)$ as "building blocks" — the same across all swings — while the coefficients $c_k$ (10 per joint, per 1000 swings) are the "weights" that tell us how the joint moved.
+
+## Define Spline Fitting Function
+
+The function below fits a cubic B-spline to a joint's time series during a swing:
+
+```{r}
+
+# Fit a B-spline to a single swing for a given joint
+fit_spline <- function(df, variable) {
+  basis <- create.bspline.basis(rangeval = c(0, 1), nbasis = 12)
+  smooth.basis(df$ScaledTime, df[[variable]], basis)$fd
+}
+
+```
+
+What this does:
+
+-   `create.bspline.basis()` defines the basis functions, which are the smooth curves we’ll combine to approximate the swing’s motion.
+
+-   We chose `nbasis = 12`, which means we’ll use 12 basis functions to model the curve.
+
+-   These basis functions are cubic polynomials — up to $t^3$ — because most smooth biomechanical motions can be captured with that level of flexibility.
+
+-   `smooth.basis()` fits the data to those basis functions using least squares, returning a smoothed functional object (`fd`) that we can use downstream.
+
+This choice (cubic, 12 basis functions) balances:
+
+-   **Smoothness** (not too wiggly)
+
+-   **Flexibility** (enough to capture real joint variation)
+
+-   **Interpretability** (each swing is summarized by 10 coefficients per joint)
+
+## Fit B-splines Across All Swings and Joints
+
+```{r}
+#| message: false
+#| warning: false
+
+fd_list <- list()
+
+for (joint in joint_vars) {
+  fd_list[[joint]] <- joint_data %>%
+    group_by(BatterLabel, SwingNumber) %>%
+    summarise(fd = list(fit_spline(cur_data(), joint)), .groups = "drop")
+}
+```
+
+In this loop, we fit a B-spline curve to each joint’s time series within every swing. Specifically:
+
+-   We iterate over each joint in our selected `joint_vars`
+
+-   For each joint, we group the data by Batter and Swing, then apply the `fit_spline()` function to each subset.
+
+-   The result is a list of functional data objects (`fd`), where each element corresponds to one swing's smooth curve for that joint
+
+The output is stored in a named list `fd_list`, where each element (e.g., `fd_list[["Hips_infoaxis"]]`) contains a data frame of fitted functional data for that joint, with one row per swing.
+
+## Extract Coefficient Array for Multivariate Functional Data
+
+After fitting a B-spline curve for each **joint × swing** pair, we want to capture the entire swing as a multivariate functional object—i.e., a set of smooth trajectories across multiple joints over time.
+
+To do that, we first extract the **B-spline coefficients** for each fitted curve and store them in a 3D array with dimensions:
+
+-   **nbasis** – number of B-spline basis functions (e.g., 12),
+
+-   **n_swings** – total number of swings (100 batters × 10 swings = 1,000),
+
+-   **n_joints** – number of selected joints (determined earlier)
+
+This shape: `coef_array[nbasis, n_swings, n_joints]` is expected by the `{fda}` package’s multivariate `fd()` constructor.
+
+-   Each slice `coef_array[ , , j]` represents the coefficient matrix for joint *j*, with one column per swing.
+
+-   Each column `coef_array[ , i, j]` encodes the smooth motion of joint *j* during swing *i*.
+
+```{r}
+# Dimensions
+nbasis <- fd_list[[1]]$fd[[1]]$basis$nbasis   # here 12
+n_swings <- nrow(fd_list[[1]])                # here 1000
+n_joints <- length(joint_vars)                # flexible, user-defined
+
+# Initialize empty coefficient array
+coef_array <- array(NA, dim = c(nbasis, n_swings, n_joints))
+
+# Fill array with B-spline coefficients
+for (jj in seq_along(joint_vars)) {
+  joint_fd_objs <- fd_list[[joint_vars[jj]]]$fd  # list of 1000 fitted curves
+  coef_array[, , jj] <- sapply(joint_fd_objs, function(fd) fd$coefs)  # [nbasis x n_swings]
+}
+
+```
+
+## Build Multivariate Functional Data Object
+
+Once we’ve extracted the full array of B-spline coefficients—representing every joint and every swing—we use the `fd()` function from the `{fda}` package to bundle them into a multivariate functional data object.
+
+```{r}
+# Use the shared basis (same for all joints/swings)
+basis_obj <- fd_list[[1]]$fd[[1]]$basis
+
+# Create multivariate functional data object
+multi_joint_fd <- fd(coef = coef_array, basisobj = basis_obj)
+
+```
+
+### What is `multi_joint_fd`?
+
+`multi_joint_fd` is a container that holds the **smoothed joint trajectories** for every swing. Each joint's movement has been modeled as a smooth B-spline curve over normalized time (`ScaledTime ∈ [0, 1]`).
+
+-   We have 1000 swings
+
+-   For each swing we modeled the motion of each joint as a smooth function
+
+-   These functions are defined by the B-spline basis functions and a set of fitted coefficients of those basis functions
+
+So each swing is represented by a set of curves — one per joint — and together, they describe the swing’s full-body movement pattern over time.
+
+### Inside `multi_joint_fd`
+
+The key component is `multi_joint_fd$coefs`, a 3D array with dimensions `[nbasis × n_swings × n_joints]`
+
+-   `multi_joint_fd$coefs[ , i, j]` gives the 12 B-spline coefficients for **swing i**, **joint j**
+
+-   These coefficients can be plugged into the shared basis functions to reconstruct the smooth curve for that joint's motion during the swing
+
+## Run Functional PCA on Multivariate Joint Trajectories
+
+Once we’ve built our `multi_joint_fd` object, which holds smooth joint curves for every swing, we use **Functional Principal Component Analysis (FPCA)** to uncover the key patterns of variation in swing biomechanics.
+
+```{r}
+# Run functional PCA: extract top 10 functional principal components (FPCs)
+fpca_multi_joint <- pca.fd(multi_joint_fd, nharm = 10)
+```
+
+### What Makes FPCA Different from Regular PCA?
+
+Let’s first revisit what standard PCA would do in this situation.
+
+#### If we Did Standard PCA:
+
+You’d flatten all basis coefficients into a matrix like this:
+
+| $\text{Swing}$ | $\text{Joint}_1,\text{Coef}_1$ | $\text{Joint}_1,\text{Coef}_2$ | $\dots$ | $\text{Joint}_{12},\text{Coef}_{12}$ |
+|--------------|--------------|--------------|--------------|-----------------|
+| $1$            | $c_1^1$                        | $c_2^1$                        | $\dots$ | $c_{14}^{1}$                         |
+| $2$            | $c_1^2$                        | $c_2^2$                        | $\dots$ | $c_{14}^{2}$                         |
+| $\dots$        | $\dots$                        | $\dots$                        | $\dots$ | $\dots$                              |
+| $100$          | $c_1^{100}$                    | $c_2^{100}$                    | $\dots$ | $c_{14}^{100}$                       |
+
+-   **Rows** = swings (observations)
+
+-   **Columns** = individual basis coefficients (12 per joint × 14 joints = 168)
+
+-   **Each cell** = a number
+
+-   **PCA** would find directions of maximum variance across these 168 features.
+
+But there’s a problem: **PCA treats each coefficient independently**, even though the 12 coefficients per joint together define a single smooth motion curve.
+
+### FPCA: Treating Curves as Variables
+
+Functional PCA recognizes this structure and instead treats each joint’s motion **as a curve**, not as 12 unrelated coefficients.
+
+So conceptually, the input table to FPCA looks like:
+
+| $\text{Swing}$ | $\text{Joint}_1$ | $\text{Joint}_2$ | $\dots$ | $\text{Joint}_{14}$ |
+|---------------|---------------|---------------|---------------|---------------|
+| $1$            | $f_{1,1}(t)$     | $f_{1,2}(t)$     | $\dots$ | $f_{1,14}(t)$       |
+| $2$            | $f_{2,1}(t)$     | $f_{2,2}(t)$     | $\dots$ | $f_{2,14}(t)$       |
+| $\dots$        | $\dots$          | $\dots$          | $\dots$ | $\dots$             |
+| $100$          | $f_{1000,1}(t)$  | $f_{1000,2}(t)$  | $\dots$ | $f_{1000,14}(t)$    |
+
+-   Each **row** is a swing.
+
+-   Each **column** is a joint.
+
+-   Each **cell** is a **smooth curve** over time, built from the 12 B-spline basis functions.
+
+This is what’s stored in `multi_joint_fd`: a `[12 basis × 1000 swings × 14 joints]` array of coefficients.
+
+### What does FPCA Do?
+
+At its core, **FPCA is trying to do the same thing as regular PCA** — find patterns that explain the most **variation** in your data — but it does so with **curves** instead of vectors.
+
+#### In Standard PCA:
+
+We try to find **linear combinations of variables** that explain the most variance in the data.
+
+Formally, PCA solves:
+
+$$
+\text{maximize Var}(Z) = \text{Var}(Xw)
+$$
+
+Where:
+
+-   $X$ is our data matrix \[1000 swings x 168 coefficients\]
+
+-   $w$ is a weight vector (what becomes a principal component)
+
+-   $Z = Xw$ is a score (a projection of your data)
+
+-   PCA chooses $w$ to maximize the variance of $Z$.
+
+In short: PCA looks for **directions (combinations of features)** that explain the most spread (variation) in the data.
+
+#### In FPCA:
+
+Instead of vectors of features, each "variable" is a **function** — a smooth curve over time.
+
+So, FPCA asks: **"Across all swings, how do curves differ? And what are the most common patterns in those differences?"**
+
+It finds **functional principal components (FPCs)** — smooth curves $\phi(k)$ that maximize the variation **in curve space**.
+
+Mathematically, FPCA solves:
+
+$$
+\text{maximize Var} \left(\int x_i(t) \cdot \phi(t) dt\right)
+$$
+
+Where:
+
+-   $x_i(t)$ is the joint curve for swing $i$
+
+-   $\phi(t)$ is the FPC (like an "eigen-curve")
+
+-   The inner product $\int x_i(t) \cdot \phi(t) dt$ is your **functional score** for swing $i$
+
+-   The goal is to find the curve $\phi(t)$ that captures the most variation in shape across swings.
+
+So instead of looking for a direction in 144D space, FPCA looks for a **curve shape** that “best explains” how joint trajectories vary.
+
+#### In our Data:
+
+FPCA finds:
+
+-   The most **common ways** these joint curves vary in **shape, timing, and coordination**,
+
+-   And expresses each swing in terms of **how much it exhibits each variation pattern** (i.e., scores).
+
+Think of FPC1 as “The most important kind of difference in swing mechanics across all players.”
+
+FPC2 is The second-most important pattern, orthogonal (independent) to FPC1.
+
+## Interpreting FPCA Results
+
+After running functional principal component analysis (FPCA), we want to understand:
+
+-   **How many components matter?**
+
+-   **What each component represents biomechanically?**
+
+-   **Which joints contribute most to each component?**
+
+To answer those questions, we follow a structured flow:
+
+1.  Variance explained
+2.  FPC shapes for a single joint
+3.  Global FPCs across all joints
+4.  Quantify joint contributions
+
+### Elbow Plot - How many components matter?
+
+Before digging into component interpretation, we check how much cumulative variance is explained by each FPC. This helps determine how many components to keep.
+
+```{r}
+
+explained_var <- fpca_multi_joint$varprop
+cumulative_var <- cumsum(explained_var)
+
+elbow_df <- data.frame(
+  Component = 1:length(cumulative_var),
+  CumulativeVariance = cumulative_var
+)
+
+ggplot(elbow_df, aes(x = Component, y = CumulativeVariance)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_hline(yintercept = 0.803, linetype = "dashed", color = "red") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "FPCA Elbow Plot",
+    x = "Number of Functional Principal Components",
+    y = "Cumulative Variance Explained"
+  ) +
+  theme_minimal()
+
+round(cumulative_var[1:3], 3)
+
+
+
+```
+
+This "elbow plot" visualizes how quickly variance accumulates. For example, if the first 3 components explain \~82%, we can focus our interpretation on just those.
+
+### Visualize FPC1-3 for a Single Joint
+
+To build intuition, we start by looking at what each FPC looks like for **one joint**.
+
+```{r}
+#| warning: false
+#| message: false
+
+plot_fpcs_joint <- function(fpca_obj, joint_idx = 1, n_harmonics = 3, grid_points = 100) {
+  grid <- seq(fpca_obj$basis$rangeval[1], fpca_obj$basis$rangeval[2], length.out = grid_points)
+  
+  plot_data <- lapply(1:n_harmonics, function(k) {
+    coef_vec <- fpca_obj$coefs[, k, joint_idx]
+    fd_obj <- fd(coef = matrix(coef_vec, ncol = 1), basisobj = fpca_obj$basis)
+    values <- as.vector(eval.fd(grid, fd_obj))
+    
+    data.frame(
+      Time = grid,
+      Value = values,
+      Component = paste0("FPC ", k)
+    )
+  }) %>% bind_rows()
+  
+  ggplot(plot_data, aes(x = Time, y = Value)) +
+    geom_line(size = 1, color = "darkblue") +
+    facet_wrap(~ Component, nrow = 1) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    labs(
+      title = paste("FPC 1–3 Curves for a Single Joint"),
+      y = "Eigenfunction Value", x = "Scaled Time"
+    ) +
+    theme_minimal()
+}
+
+# Example: Plot FPC1–3 for the first joint
+plot_fpcs_joint(fpca_multi_joint$harmonics, joint_idx = 1)
+
+```
+
+### Visualize Global FPCs (All Joints)
+
+Now we look at the **entire set of joints** for each FPC. This gives a full-body view of what the component represents.
+
+```{r}
+plot_global_fpc <- function(fpca_harmonics, fpc_idx = 1, joint_names = NULL, grid_points = 100) {
+  if (is.null(joint_names)) {
+    n_joints <- dim(fpca_harmonics$coefs)[3]
+    joint_names <- paste0("Joint ", 1:n_joints)
+  }
+
+  grid <- seq(fpca_harmonics$basis$rangeval[1],
+              fpca_harmonics$basis$rangeval[2],
+              length.out = grid_points)
+
+  n_joints <- dim(fpca_harmonics$coefs)[3]
+
+  plot_data <- lapply(1:n_joints, function(j) {
+    coef_vec <- fpca_harmonics$coefs[, fpc_idx, j]
+    fd_obj <- fd(coef = matrix(coef_vec, ncol = 1), basisobj = fpca_harmonics$basis)
+    values <- as.vector(eval.fd(grid, fd_obj))
+
+    data.frame(
+      Time = grid,
+      Value = values,
+      Joint = joint_names[j]
+    )
+  }) %>% bind_rows()
+
+  ggplot(plot_data, aes(x = Time, y = Value, color = Joint)) +
+    geom_line(size = 1) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    labs(
+      title = paste("Global FPC", fpc_idx, ": Joint-wise Curves"),
+      x = "Scaled Time", y = "Eigenfunction Value",
+      color = "Joint"
+    ) +
+    theme_minimal()
+}
+
+# Plot global FPCs 1 to 3
+plot_global_fpc(fpca_multi_joint$harmonics, fpc_idx = 1, joint_names = joint_vars)
+plot_global_fpc(fpca_multi_joint$harmonics, fpc_idx = 2, joint_names = joint_vars)
+plot_global_fpc(fpca_multi_joint$harmonics, fpc_idx = 3, joint_names = joint_vars)
+
+```
+
+Each line is a joint's contribution to the selected FPC. You'll see:
+
+-   Which joints are most active
+
+-   When in the swing they contribute most (early vs. late)
+
+-   Whether joints move in sync (same sign) or oppositely (different signs)
+
+This helps determine if an FPC represents a **global movement pattern** or a **joint-specific feature**.
+
+### Quantify Which Joints Drive Each FPC
+
+To back up the visual interpretation, we compute how much each joint contributes to each FPC numerically.
+
+```{r}
+get_joint_variance_contrib <- function(fpca_harmonics, fpc_idx = 1) {
+  coefs <- fpca_harmonics$coefs[, fpc_idx, ]
+  joint_variance <- apply(coefs, 2, function(c) sum(c^2))
+  joint_variance / sum(joint_variance)
+}
+
+# Print joint-wise contributions for FPC 1–3
+sapply(1:3, function(k) round(get_joint_variance_contrib(fpca_multi_joint$harmonics, k), 3))
+
+```
+
+## Visualize Swings in FPC Score Space (3D)
+
+Each swing has been transformed into a set of scores on the first 10 functional principal components (FPCs) — but **per joint** so our data is shaped like `[1000 swings × 10 FPCs × 14 joints]`. For each swing we have a 10-dimensional vector of PC scores for each joint
+
+This is just for visualization purposes but if we want to see them in a 3D space we have to reduce along the joint dimension by averaging across joints.
+
+```{r}
+
+# Collapse the joint dimension: average scores across joints
+fpca_scores_matrix <- apply(fpca_multi_joint$scores, c(1, 2), mean)  # now [1000 swings × 10 FPCs]
+
+fpca_scores <- as.data.frame(fpca_scores_matrix[, 1:3])
+colnames(fpca_scores) <- c("FPC1", "FPC2", "FPC3")
+
+# Optional: add swing and batter IDs
+fpca_scores$BatterLabel <- swing_metadata$BatterLabel
+fpca_scores$SwingNumber <- swing_metadata$SwingNumber
+
+
+plot_ly(
+  data = fpca_scores,
+  x = ~FPC1, y = ~FPC2, z = ~FPC3,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 3, color = "grey", opacity = 0.7)
+)
+
+
+```
+
+We see these a structureless blob - suggesting no clear clustering or separation between hitters based on their joint motion patterns.
+
+This isn't surprising: **PCA is a linear method,** meaning it can only capture variation along straight lines (linear combinations of the original features). If the true differences in swing mechanics lie along nonlinear patterns or curved manifolds, PCA won’t uncover them.
+
+To explore this possibility, we turn to a **nonlinear dimensionality reduction technique** called **UMAP (Uniform Manifold Approximation and Projection)**. Unlike PCA, UMAP is designed to preserve the local structure of the data and uncover complex patterns that may be hidden in higher dimensions.
+
+## What is UMAP?
+
+### Constructing a Graph in FPCA (High-Dimensional) Space
+
+UMAP assumes that the 3D FPCA scores we computed for each **swing** (PC1, PC2, PC3) lie on a **low-dimensional curved surface** (a *manifold*) embedded in a higher-dimensional space. Its job is to uncover and "flatten" this structure so we can visualize it in 2D or 3D.
+
+**Step by Step Process**
+
+1.  Compute nearest neighbors for each swing
+
+UMAP looks at the 3D FPCA spaces where each **point = one swing**
+
+For every swing it finds the `n_neighbors` (e.g., 15) closest swings using Euclidean distance between their PC1, PC2, and PC3 values which gives a sense of *local similarity* between swings — swings that move similarly over time will have similar FPCA scores and will be neighbors.
+
+2.  Build a Fuzzy Graph of Swing relationships
+
+UMAP constructs a weighted graph where each edge (link between 2 swings) has a weight that is a probability that reflects how close swings are in FPCA space. These probabilities are caclulated using an exponential kernel:
+
+$$ p_{ij} = \text{exp}(- \frac{||x_i - x_j||^2}{\sigma_i}) $$
+
+where:
+
+-   $x_i$ and $x_j$ are the FCPA scores for 2 swings
+
+-   $\sigma_i$ is a local distance scale for swing $i$ chosen so that each swing has a similar number of neighbors
+
+-   This graph is called of **fuzzy simplicial set** - think of it as a "soft" network showing how connected the swings are based on movement similarity
+
+When I say "graph" I mean the structure we just made that consists of nodes (represent the individual swings based on the 3 FPCA scores) and edges (that represent the similarity between swings based on those FPCA scores with a weight between 0 and 1 that tells us how similar they are). Close swings in the graph have strong edges and distance swings have weak or no edges.
+
+Now we want to recreate this graph in 2D space (UMAP1 and UMAP2) such that close swings in the FPCA space are still close in UMAP space.
+
+### Mapping to a 2D Space While Preserving the Graph
+
+1.  **Build a similar graph in 2D**
+
+We start by placing swings randomly in 2D and then UMAP builds another fuzzy graph using a new kernel (function that defines similarity, the idea is that we turn distances into similarities).
+
+The new kernel for a 2D space is to compute low-dimensional connection strength is:
+
+$$ q_{ij} = \frac{1}{1+a \times ||y_i - y_j||^{2b}} $$
+
+where:
+
+-   $y_i, y_j$ = UMAP 2D coordinates
+
+-   $a,b$ are constants determined internally when we set the `min_dist` setting in `R`. This setting controls how close points are in the 2D space and then UMAP uses an optimization technique that finds values of `a` and `b` that match the desired spacing. These are not set manually. Smaller `min_dist` leads to larger `a` and `b` that result in tighter clusters.
+
+-   $q_{ij} \in (0,1)$ = how connected points are in 2D
+
+2.  **Match the Two Graphs (Optimization)**
+
+UMAP tries to make the 2D graph **match the structure** of the high-dimensional one. It does this by minimizing the difference between the two graphs, using a cross-entropy loss function:
+
+$$ \text{Loss} = \sum_{i \neq j} [p_{ij} \text{log}(q_{ij}) + (1-p_{ij}) \text{log}(1-q_{ij})] $$
+
+where:
+
+-   $p_{ij}$ is the probability that swings $i$ and $j$ are neighbors in the **original FPCA space**.
+
+-   $q_{ij}$ is the probability they're neighbors in the **UMAP 2D space.**
+
+-   The results is that swings with similar joint movement patterns over time are group together but now on a 2D map we can visualize
+
+## Apply UMAP on FPCA Scores (Per Swing)
+
+**Back to the data**
+
+If our swing mechanics vary in more **complex, curved, or nonlinear ways**, PCA won't reveal those relationships.
+
+To address this, we use **UMAP (Uniform Manifold Approximation and Projection)** — previously explained.
+
+We start by using the top 3 FPCA components for each swing — a compact numerical summary of swing mechanics. These 3 values become the "features" for UMAP.
+
+-   `n_neighbors = 15`: UMAP tries to preserve relationships between each swing and its 15 nearest neighbors. A lower number focuses on local detail; a higher number generalizes more.
+
+-   `min_dist = 0.1`: Controls how tightly UMAP groups similar points. Lower values make clusters more compact.
+
+-   `n_components = 3`: We reduce the data down to 3 dimensions so we can visualize it in 3D.
+
+### Flatten the FPCA Scores Across Joints
+
+```{r}
+# Original shape: [1000 swings × 10 FPCs × 14 joints]
+# We want:        [1000 × 3 FPCs × 14 joints] → flatten to [1000 × 42]
+
+fpca_scores_subset <- fpca_multi_joint$scores[, 1:3, ]  # take only FPCs 1–3
+dim(fpca_scores_subset)  # should be [1000, 3, 14]
+
+# Reshape to [1000 × 42] → each row is a swing, each column is FPC_joint combination
+fpca_scores_flat <- apply(fpca_scores_subset, 1, function(swing) as.vector(swing))
+fpca_scores_flat <- t(fpca_scores_flat)  # transpose to [1000 × 42]
+
+
+```
+
+### Run 3D UMAP
+
+```{r}
+library(umap)
+
+umap_config <- umap.defaults
+umap_config$n_neighbors <- 15
+umap_config$min_dist <- 0.1
+umap_config$n_components <- 3 # Plot in 3 dimensions
+
+set.seed(1)
+umap_result <- umap(fpca_scores_flat, config = umap_config)
+
+fpca_scores$UMAP1 <- umap_result$layout[, 1]
+fpca_scores$UMAP2 <- umap_result$layout[, 2]
+fpca_scores$UMAP3 <- umap_result$layout[, 3]
+
+library(plotly)
+
+plot_ly(
+  data = fpca_scores,
+  x = ~UMAP1, y = ~UMAP2, z = ~UMAP3,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 3, color = "darkblue", opacity = 0.7)
+) %>%
+  layout(
+    title = "3D UMAP of Swings",
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "UMAP 3")
+    )
+  )
+
+
+```
+
+## Clustering Individual Swings Using GMM
+
+Now that we've applied UMAP to visualize swings, now we want to group these swings in distinct biomechanical types.
+
+To explore this, we use **Gaussian Mixture Models (GMM)** — a probabilistic clustering algorithm that assumes each group of points comes from a multivariate Gaussian distribution.
+
+### How GMM Works
+
+1.  Assume a mixture of Gaussians
+
+GMM assumes our data was generated by a combination of $K$ Gaussian distributions:
+
+$$ P(x) = \sum_{k=1}^{K} \pi_k \times \mathcal{N}(x|\mu_k, \Sigma_k) $$
+
+-   $\pi_k$: the weight (proportion, probability of being part) of cluster $k$
+
+-   $\mu_k$: the center (mean) of cluster $k$
+
+-   $\Sigma_k$: the covariance matrix (shape/size/orientation) of cluster $k$
+
+2.  Estimate Parameters Using Expectation-Maximization
+
+**E-Step (Expectation):** For each batter, calculate the probability that they belong to each cluster based on current parameters.
+
+**M-Step (Maximization):** Update the parameters $\pi_k, \mu_k, \Sigma_k$ to maximize the likelihood of the data under those probabilities.
+
+This repeats until convergence.
+
+3.  Choose the best number of clusters
+
+We let `Mclust()` explore 1-10 clusters. It used BIC (Bayesian Information Criterion) to decide which model fits best without overfitting.
+
+### What we Get from GMM
+
+For each batter we got a cluster label, a probability vector showing how likely they are to belong to each cluster, a center/shape for each cluster ($\mu_k, \Sigma_k$)
+
+And because GMM is probabilistic we also were able to plot an ellipse showing the 95% confidence interval of each cluster, so we can potentially investigate uncertain assignments (players who don't belong to a cluster, although this doesn't look too applicable in our data).
+
+These soft cluster assignments, allow us to understand not only *which* group a hitter belongs to, but *how confidently* the model made that assignment.
+
+### Set the number of swing level clusters we want:
+
+Using something like `gmm_model <- Mclust(umap_input, G = 1:10)` will always just pick the largest `G` but the clusters don't look great visually. We thought `G = 4` was the best when we inspected visually.
+
+```{r}
+num_swing_clusters <- 4
+```
+
+```{r}
+
+# Use UMAP3D coordinates as input
+umap_input <- fpca_scores[, c("UMAP1", "UMAP2", "UMAP3")]
+
+# Fit GMM with automatic model selection
+gmm_model <- Mclust(umap_input, G = num_swing_clusters)
+
+# Add GMM cluster assignments to the dataframe
+fpca_scores$GMM_Cluster <- as.factor(gmm_model$classification)
+
+# Add cluster probability for each point (confidence)
+fpca_scores$GMM_Uncertainty <- 1 - apply(gmm_model$z, 1, max)
+
+```
+
+```{r}
+
+plot_ly(
+  data = fpca_scores,
+  x = ~UMAP1, y = ~UMAP2, z = ~UMAP3,
+  color = ~GMM_Cluster,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 3, opacity = 0.8)
+) %>%
+  layout(
+    title = "3D UMAP Clustering of Swings (GMM)",
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "UMAP 3")
+    )
+  )
+
+```
+
+### Swing Consistency by Batter
+
+Each batter has 10 swings. We want to know **How often do a batter's swings fall into the same GMM cluster?**
+
+This helps us evaluate mechanical repeatability.
+
+-   A batter with all 10 swings in the same cluster shows high consistency.
+
+-   A batter with swings spread across clusters may have more variability.
+
+**Count Swings per Cluster for Each Batter**
+
+```{r}
+
+# Make sure GMM_Cluster is a factor or character (not numeric)
+fpca_scores$GMM_Cluster <- as.character(fpca_scores$GMM_Cluster)
+
+# Count swings per cluster per batter
+swing_consistency_table <- fpca_scores %>%
+  group_by(BatterLabel, GMM_Cluster) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  pivot_wider(
+    names_from = GMM_Cluster,
+    values_from = Count,
+    values_fill = 0,
+    names_prefix = "Cluster_"
+  )
+
+# Display the result in a table
+kable(
+  swing_consistency_table,
+  caption = "Swing Consistency: Number of Swings per Cluster for Each Batter"
+)
+```
+
+## Batter-Level UMAP on Averaged FPCA Scores
+
+Each batter has 10 swings. To capture a **biomechanical signature** for each batter, we compute the **average FPCA profile** across their swings, and apply **UMAP** to embed batters in a 3D space based on their swing characteristics.
+
+### Why Average FPCA Scores?
+
+We previously computed **swing-level FPCA scores**, using the first 3 functional principal components (FPC1–FPC3) for each joint. This gave us 42 features per swing (3 FPCs × 14 joints): `[1000 swings × 3 FPCs × 14 joints] → [1000 swings × 42 features]`
+
+We now **average** those 42-dimensional vectors across the 10 swings for each batter to obtain: `[100 batters × 42 features]`
+
+```{r}
+
+# --- Flatten FPC1-3 Scores Per Swing ---
+
+# Already computed:
+# fpca_scores_subset: [1000 swings × 3 FPCs × 14 joints]
+
+# Flatten to [1000 × 42]
+fpca_swing_features <- apply(fpca_scores_subset, 1, function(swing) as.vector(swing))
+fpca_swing_features <- t(fpca_swing_features)
+
+# --- Add Batter Labels to Swing Data ---
+
+fpca_swing_df <- as.data.frame(fpca_swing_features)
+fpca_swing_df$BatterLabel <- fpca_scores$BatterLabel
+
+# --- Average FPCA Features Per Batter ---
+
+fpca_batter_df <- fpca_swing_df %>%
+  group_by(BatterLabel) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop")
+
+# --- Run UMAP on Batter-Level FPCA Features ---
+
+batter_umap_config <- umap.defaults
+batter_umap_config$n_neighbors <- 10
+batter_umap_config$min_dist <- 0.1
+batter_umap_config$n_components <- 3 # Still plotting in 3-dimensions
+
+set.seed(1)
+batter_umap_result <- umap(fpca_batter_df %>% dplyr::select(-BatterLabel), config = batter_umap_config)
+
+# --- Combine UMAP Coordinates with Batter Labels
+
+batter_umap_coords <- as.data.frame(batter_umap_result$layout)
+colnames(batter_umap_coords) <- c("UMAP1", "UMAP2", "UMAP3")
+batter_umap_coords$BatterLabel <- fpca_batter_df$BatterLabel
+
+# --- Step 6: Visualize Batter-Level UMAP in 3D ---
+
+plot_ly(
+  data = batter_umap_coords,
+  x = ~UMAP1, y = ~UMAP2, z = ~UMAP3,
+  type = "scatter3d",
+  mode = "markers+text",
+  text = ~BatterLabel, # This line makes the plot look bad, but you can inspect batters if you want
+  marker = list(size = 4, color = "grey", opacity = 0.7)
+) %>%
+  layout(
+    title = "3D UMAP of Batters (Averaged FPCA Scores)",
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "UMAP 3")
+    )
+  )
+
+
+
+```
+
+## Clustering Batters Using GMM on UMAP Coordinates
+
+### Number of Batter clusters
+
+We wanted to make the number of clusters at the Batter-level to match the number of clusters at the swing level, so we decided to make them equal but you can do whatever you'd like here.
+
+```{r}
+num_batter_clusters <- num_swing_clusters
+```
+
+```{r}
+# Use 3D UMAP coordinates as input
+batter_gmm <- Mclust(batter_umap_coords[, c("UMAP1", "UMAP2", "UMAP3")], G = num_batter_clusters)
+
+# Add cluster labels and uncertainty to dataframe
+batter_umap_coords$GMM_Cluster <- as.factor(batter_gmm$classification)
+batter_umap_coords$Uncertainty <- 1 - apply(batter_gmm$z, 1, max)
+
+
+plot_ly(
+  data = batter_umap_coords,
+  x = ~UMAP1, y = ~UMAP2, z = ~UMAP3,
+  type = "scatter3d",
+  mode = "markers+text",
+  color = ~GMM_Cluster,
+  colors = "Set2",
+  marker = list(size = 4, opacity = 0.8)
+) %>%
+  layout(
+    title = "3D UMAP of Batters (GMM Clustering)",
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "UMAP 3")
+    )
+  )
+
+```
+
+## The Problem with UMAP: Randomness & Reproducibility
+
+While UMAP helped reveal meaningful structure in our batter data, there's an important limitation: **UMAP is stochastic.** That means:
+
+-   Every time you run UMAP, even with the same input data and parameters, the result may be different—**unless you fix the random seed**.
+
+-   Even with the same random seed, results can differ across machines or environments due to differences in the UMAP implementation (CRAN doesn't respect the `set.seed()` function).
+
+This is a problem when we want to define stable, reproducible clusters of hitters. If a different run of UMAP produces different clusters, then we can't reliably describe or compare groups of hitters.
+
+------------------------------------------------------------------------
+
+## A Solution: Consensus Clustering
+
+To address this, we implemented consensus clustering, which stabilizes the results by combining many UMAP runs.
+
+Here is the idea of it:
+
+1.  **Repeat UMAP 250 times**, each with a different seed.
+2.  For each run, apply **Gaussian Mixture Model (GMM)** clustering.
+3.  For every pair of batters, count how many times they were placed in the same cluster.
+4.  For every pair of batters, count how many times they were placed in the same cluster across all 100 runs.
+5.  Build a **co-occurrence matrix** and convert it to a **distance matrix** (batters often clustered together are close).
+6.  Use **hierarchical clustering** on this matrix to define final “robust” clusters.
+
+Each cluster gets a **robustness score**, representing how consistently its members were grouped together across UMAP seeds. This approach lets us keep the flexibility of UMAP (nonlinear structure!) while ensuring the cluster assignments are stable and reproducible.
+
+### Step 1: Run UMAP + GMM 250 Times
+
+```{r}
+# --- Consensus Clustering: UMAP + GMM across 250 seeds ---
+
+num_iterations <- 250
+batter_labels <- fpca_batter_df$BatterLabel
+num_batters <- length(batter_labels)
+cluster_results <- vector("list", num_iterations)
+
+all_cluster_assignments <- matrix(NA, nrow = num_batters, ncol = num_iterations)
+rownames(all_cluster_assignments) <- batter_labels
+
+# --- Run UMAP + GMM 250 Times ---
+for (ii in 1:num_iterations) {
+
+  batter_umap_config <- umap.defaults
+  batter_umap_config$n_neighbors <- 10
+  batter_umap_config$min_dist <- 0.1
+  batter_umap_config$n_components <- 3
+  batter_umap_config$random_state <- ii * 100  
+  set.seed(ii * 100) 
+ 
+  # Run UMAP
+  umap_result <- umap(fpca_batter_df %>% dplyr::select(-BatterLabel), config = batter_umap_config)
+ 
+  # Store UMAP coordinates
+  umap_df <- as.data.frame(umap_result$layout)
+  colnames(umap_df) <- c("UMAP1", "UMAP2", "UMAP3")
+  umap_df$BatterLabel <- fpca_batter_df$BatterLabel
+ 
+  # Run GMM Clustering
+  gmm_model <- Mclust(umap_df[, c("UMAP1", "UMAP2", "UMAP3")], G = num_batter_clusters)
+ 
+  cluster_results[[ii]] <- data.frame(
+    BatterLabel = umap_df$BatterLabel,
+    Cluster = gmm_model$classification
+  )
+}
+```
+
+We have to align cluster labels such that, for example, "Cluster 1" is consistent across every iteration.
+
+```{r}
+# --- Align cluster labels across iterations ---
+
+align_cluster_labels <- function(cluster_results) {
+  # Use the first iteration as reference
+  reference <- cluster_results[[1]]
+  
+  # For each subsequent iteration, align its labels
+  for (ii in 2:length(cluster_results)) {
+    current <- cluster_results[[ii]]
+    
+    # Create contingency table of cluster assignments
+    contingency <- table(reference$Cluster, current$Cluster)
+    
+    # Initialize mapping vector
+    mapped_labels <- rep(0, ncol(contingency))
+    
+    # Continue until all labels are mapped
+    while(any(mapped_labels == 0) && any(apply(contingency, 2, sum) > 0)) {
+      # Find position of maximum overlap
+      max_val <- max(contingency)
+      
+      if (max_val == 0) break  # No more valid mappings
+      
+      # Get indices of maximum value
+      max_indices <- which(contingency == max_val, arr.ind = TRUE)
+      if (nrow(max_indices) > 0) {
+        row_idx <- max_indices[1, 1]  # Reference cluster
+        col_idx <- max_indices[1, 2]  # Current cluster
+        
+        mapped_labels[col_idx] <- row_idx
+        
+        contingency[row_idx, ] <- 0
+        contingency[, col_idx] <- 0
+      }
+    }
+    
+    # Handle any remaining unmapped clusters
+    if(any(mapped_labels == 0)) {
+      unmapped <- which(mapped_labels == 0)
+      unused_ref <- setdiff(1:num_batter_clusters, mapped_labels)
+      
+      for(jj in 1:length(unmapped)) {
+        if(length(unused_ref) >= jj) {
+          mapped_labels[unmapped[jj]] <- unused_ref[jj]
+        } else {
+          # If no unused reference clusters, use the first available
+          mapped_labels[unmapped[j]] <- min(unused_ref)
+        }
+      }
+    }
+    
+    # Apply mapping to update labels (handle potential out-of-bounds)
+    new_clusters <- rep(1, length(current$Cluster))  # Default to 1 if mapping fails
+    for (jj in 1:length(mapped_labels)) {
+      new_clusters[current$Cluster == jj] <- mapped_labels[jj]
+    }
+    
+    if(any(is.na(new_clusters))) {
+      most_common <- as.numeric(names(which.max(table(new_clusters, useNA = "no"))))
+      new_clusters[is.na(new_clusters)] <- most_common
+    }
+    
+    cluster_results[[ii]]$Cluster <- new_clusters
+  }
+  
+  return(cluster_results)
+}
+
+aligned_results <- align_cluster_labels(cluster_results)
+
+```
+
+Next, we take the aligned results and generate a `batter_cluster_summary`, which summarizes each batter's assignment distribution across the four clusters and most frequently assigned to cluster.
+
+```{r}
+# --- Process aligned results ---
+
+cluster_matrix <- do.call(cbind, lapply(aligned_results, function(df) df$Cluster))
+rownames(cluster_matrix) <- aligned_results[[1]]$BatterLabel
+
+# Ensure no null values are in the cluster matrix
+if(any(is.na(cluster_matrix))) {
+  # Replace null values with the most common cluster for that batter
+  for(ii in 1:nrow(cluster_matrix)) {
+    na_cols <- which(is.na(cluster_matrix[ii,]))
+    if(length(na_cols) > 0) {
+      most_common <- as.numeric(names(which.max(table(cluster_matrix[ii,-na_cols], useNA = "no"))))
+      cluster_matrix[ii,na_cols] <- most_common
+    }
+  }
+}
+
+# --- Count Occurrences in Each Cluster ---
+
+cluster_counts <- t(apply(cluster_matrix, 1, function(clusters) {
+  tab <- table(factor(clusters, levels = 1:num_batter_clusters))
+  return(as.vector(tab))
+}))
+colnames(cluster_counts) <- paste0("Cluster_", 1:num_batter_clusters)
+
+# --- Find Most Frequent Cluster and Frequency ---
+most_frequent_info <- t(apply(cluster_matrix, 1, function(clusters) {
+  cluster_counts <- table(clusters)
+  most_common <- as.numeric(names(which.max(cluster_counts)))
+  freq <- max(cluster_counts) / ncol(cluster_matrix)
+  return(c(most_common, freq))
+}))
+
+# --- Combine into a DataFrame ---
+batter_cluster_summary <- data.frame(
+  BatterLabel = rownames(cluster_counts),
+  cluster_counts,  # Add count columns
+  Most_Frequent_Cluster = most_frequent_info[, 1],  # Most common cluster
+  Frequency = most_frequent_info[, 2]  # How often they were in that cluster
+)
+```
+
+### Step 2: Build Co-Occurrence Matrix
+
+```{r}
+# --- Build co-occurrence matrix from GMM cluster assignments ---
+
+# Ensure consistent ordering
+batter_ids <- sort(unique(fpca_batter_df$BatterLabel))
+n_batters <- length(batter_ids)
+
+# Create mapping from BatterLabel to index in matrix
+batter_idx <- setNames(seq_along(batter_ids), batter_ids)
+
+# Initialize co-occurrence matrix
+co_occurrence <- matrix(0, nrow = n_batters, ncol = n_batters,
+                        dimnames = list(batter_ids, batter_ids))
+
+# Fill co-occurrence counts using aligned results
+for (ii in 1:num_iterations) {
+  clusters <- aligned_results[[ii]]  # Use aligned_results instead of cluster_results
+  
+  for (cluster_id in unique(clusters$Cluster)) {
+    batters <- clusters$BatterLabel[clusters$Cluster == cluster_id]
+    
+    if (length(batters) > 1) {
+      for (jj in 1:(length(batters) - 1)) {
+        for (kk in (jj + 1):length(batters)) {
+          idx_j <- batter_idx[batters[jj]]
+          idx_k <- batter_idx[batters[kk]]
+          
+          co_occurrence[idx_j, idx_k] <- co_occurrence[idx_j, idx_k] + 1
+          co_occurrence[idx_k, idx_j] <- co_occurrence[idx_k, idx_j] + 1  # symmetry
+        }
+      }
+    }
+  }
+}
+
+```
+
+### Step 3: Hierarchical Clustering
+
+```{r}
+
+# --- Convert co-occurrence matrix to distance matrix ---
+distance_matrix <- 1 - (co_occurrence / num_iterations)  # range: 0 to 1
+
+# --- Hierarchical clustering ---
+hc <- hclust(as.dist(distance_matrix), method = "ward.D2")
+
+# --- Cut tree into K consensus clusters ---
+k_clusters <- num_batter_clusters
+robust_clusters <- cutree(hc, k = k_clusters)
+
+# Map cluster labels back to BatterLabel
+robust_cluster_df <- data.frame(
+  BatterLabel = names(robust_clusters),
+  RobustCluster = as.factor(robust_clusters)
+)
+
+# Color branches of the dendrogram by cluster
+dend <- as.dendrogram(hc)
+colors <-  c(
+  "1" = "#66c2a5",  # green
+  "2" = "#fc8d62",  # orange
+  "3" = "#8da0cb",  # blue
+  "4" = "#e78ac3"   # pink
+)  # Added a 4th color
+dend_colored <- color_branches(dend, k = k_clusters, col = colors) 
+
+# Plot dendrogram
+plot(
+  dend_colored,
+  main = "Consensus Clustering on Batters (UMAP + GMM)",
+  ylab = "Dissimilarity (1 - Co-occurrence Rate)",
+  cex.lab = 1.1,
+)
+```
+
+### Step 4: Robustness Score Calculation
+
+```{r}
+# --- Helper function to compute average co-occurrence within a cluster ---
+calculate_cluster_robustness <- function(cluster_id, clusters, co_matrix, iterations) {
+  batters <- names(clusters[clusters == cluster_id])
+  if (length(batters) <= 1) return(1)  # singleton clusters = perfectly robust
+  
+  sum_pairs <- 0
+  count_pairs <- 0
+  
+  for (ii in 1:(length(batters) - 1)) {
+    for (jj in (ii + 1):length(batters)) {
+      sum_pairs <- sum_pairs + co_matrix[batters[ii], batters[jj]]
+      count_pairs <- count_pairs + 1
+    }
+  }
+  
+  return(sum_pairs / (count_pairs * iterations))
+}
+
+```
+
+```{r}
+# Add RobustCluster to batter-level dataframe (ensure consistent order)
+robust_cluster_df <- robust_cluster_df %>%
+  arrange(BatterLabel)
+
+# Add robustness score per cluster
+cluster_summary <- robust_cluster_df %>%
+  group_by(RobustCluster) %>%
+  summarise(
+    Count = n(),
+    Batters = paste(sort(as.numeric(BatterLabel)), collapse = ", "),
+    Robustness = calculate_cluster_robustness(
+      unique(RobustCluster),
+      robust_clusters,
+      co_occurrence,
+      num_iterations
+    )
+  )
+
+kable(cluster_summary,
+      col.names = c("Robust Cluster", "n", "Batters in Cluster", "Robustness Score"),
+      caption = "Consensus Clustering Summary Table")
+
+```
+
+## Validation
+
+### Generate a Representative Set of Batters
+
+To compensate for the fact that we are using hard cluster assignments (a batter is assigned to the cluster for which it has the highest assignment probability) instead of leveraging the assignment probability distributions themselves, we derive a representative set of batters.
+
+```{r}
+analyze_cluster_consistency <- function(batter_cluster_summary, thresholds = seq(0.5, 1, by = 0.05)) {
+
+  results <- data.frame(
+    threshold = thresholds,
+    batters_captured = numeric(length(thresholds)),
+    batters_per_cluster = matrix(0, nrow = length(thresholds), ncol = num_batter_clusters)
+  )
+  colnames(results)[3:6] <- paste0("cluster_", 1:num_batter_clusters)
+  
+  for (i in seq_along(thresholds)) {
+    threshold <- thresholds[i]
+    
+    consistent_batters <- batter_cluster_summary %>%
+      filter(Frequency >= threshold)
+    
+    results$batters_captured[i] <- nrow(consistent_batters)
+    
+    for (cluster_id in 1:4) {
+      cluster_count <- sum(consistent_batters$Most_Frequent_Cluster == cluster_id)
+      results[i, paste0("cluster_", cluster_id)] <- cluster_count
+    }
+  }
+  
+  return(results)
+}
+
+plot_consistency_analysis <- function(results) {
+  
+  ggplot(results, aes(x = threshold, y = batters_captured)) +
+    geom_line(color="steelblue") +
+    geom_point(color="steelblue") +
+    geom_hline(yintercept = results[abs(results$threshold - 0.85) < 0.0001
+                                    , ]$batters_captured,
+               color = "red",
+               linetype = "dashed") + 
+    geom_vline(xintercept = 0.85,  # <-- vertical dashed line at x = 0.85
+               color = "red",
+               linetype = "dashed",
+               size = 1) +
+    labs(title = "Batters Captured Overall at Different Consistency Thresholds", 
+         x = "Consistency Threshold", y = "Total Batters Captured") +
+    theme_minimal() +
+    scale_fill_brewer(palette = "Set2")
+}
+    
+results <- analyze_cluster_consistency(batter_cluster_summary)
+plot_consistency_analysis(results)
+```
+
+```{r}
+# Helper function to get batters at a specific threshold:
+get_consistent_batters <- function(batter_cluster_summary, threshold) {
+  consistent_batters <- batter_cluster_summary %>%
+    filter(Frequency >= threshold)
+  
+  return(data.frame(
+    BatterLabel = consistent_batters$BatterLabel,
+    MostFrequentCluster = consistent_batters$Most_Frequent_Cluster
+  ))
+}
+
+consistent_batters_85 <- get_consistent_batters(batter_cluster_summary, 0.85)
+```
+
+```{r}
+# Add RobustCluster to batter-level dataframe (ensure consistent order)
+rep_batters <- batter_cluster_summary %>%
+  filter(BatterLabel %in% consistent_batters_85$BatterLabel)
+
+# Add robustness score per cluster
+cluster_summary <- rep_batters %>%
+  group_by(Most_Frequent_Cluster) %>%
+  summarise(
+    RepresentativeBatters = paste(sort(as.numeric(BatterLabel)), collapse = ", "),
+    Count = n()
+  )
+
+kable(cluster_summary,
+      col.names = c("Cluster", "Representative Batters", "Count"))
+
+```
+
+### Random Forest to Cluster Profiles
+
+Next, we use random forests as a way to profile clusters. Only considering the representative sets of batters and taking their robust cluster assignment to be the target variable, we can run the model with the biomechanical features in the summary dataset. This reduces bias by running the cluster assignments on unseen data. We can also then take advantage of feature importance rankings.
+
+```{r}
+#| warning: false
+#| message: false
+
+orig_condensed <- read_parquet(outcomes_path)
+
+# Start by filtering to consistent batters
+filtered_orig_condensed_full <- orig_condensed %>%
+  filter(BatterLabel %in% consistent_batters_85$BatterLabel) %>%
+  mutate(BatterLabel = as.numeric(BatterLabel)) %>%
+  arrange(BatterLabel)
+
+# Make a modeling version WITHOUT HitResult and SwingResult
+filtered_orig_condensed_model <- filtered_orig_condensed_full %>%
+  dplyr::select(-VBALaunch, -LaunchPosition, -BatContactLocation,
+                -SwingNumber, -BatterHandedness, -PitchInfoPitchGroup,
+                -HitResult, -SwingResult) %>%
+  group_by(BatterLabel) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
+  arrange(BatterLabel)
+
+# First fix consistent_batters_85
+consistent_batters_85 <- consistent_batters_85 %>%
+  mutate(BatterLabel = as.numeric(BatterLabel))
+
+# Then you can safely join
+filtered_orig_condensed_full <- filtered_orig_condensed_full %>%
+  left_join(consistent_batters_85 %>% dplyr::select(BatterLabel, MostFrequentCluster), by = "BatterLabel") %>%
+  mutate(MostFrequentCluster = as.factor(MostFrequentCluster))
+
+filtered_orig_condensed_model <- filtered_orig_condensed_model %>%
+  left_join(consistent_batters_85 %>% dplyr::select(BatterLabel, MostFrequentCluster), by = "BatterLabel") %>%
+  mutate(MostFrequentCluster = as.factor(MostFrequentCluster))
+
+
+
+```
+
+```{r}
+# Get feature importance from a random forest
+get_importance <- function(i) {
+  rf.model <- randomForest(MostFrequentCluster ~ . -BatterLabel,
+                           data = filtered_orig_condensed_model,
+                           importance = TRUE)
+  return(importance(rf.model))
+}
+
+set.seed(1)
+iterations <- 20
+importance_list <- lapply(1:iterations, get_importance)
+
+process_cluster_importance <- function(importance_list) {
+
+  feature_names <- rownames(importance_list[[1]])
+  cluster_cols <- grep("^[0-9]+$", colnames(importance_list[[1]]), value = TRUE)
+  
+  n_features <- length(feature_names)
+  n_clusters <- length(cluster_cols)
+  
+  cluster_importance <- matrix(0, nrow = n_features, ncol = n_clusters)
+  
+  top_features_per_cluster <- list()
+  
+  for (ii in 1:length(importance_list)) {
+    imp <- importance_list[[ii]]
+    
+    for (jj in 1:n_clusters) {
+      cluster_importance[, jj] <- cluster_importance[, jj] + imp[, cluster_cols[jj]]
+      
+      # Identify top 5 features for this cluster in this iteration
+      sorted_idx <- order(imp[, cluster_cols[jj]], decreasing = TRUE)
+      top_10_features <- feature_names[sorted_idx[1:5]]  # Top 5 feature names
+      
+      # Store top 5 features for this cluster across all iterations
+      top_features_per_cluster[[cluster_cols[jj]]] <- unique(c(top_features_per_cluster[[cluster_cols[jj]]], top_10_features))
+    }
+  }
+  
+  cluster_importance <- cluster_importance / length(importance_list)
+  
+  result_df <- data.frame(cluster_importance)
+  colnames(result_df) <- cluster_cols
+  rownames(result_df) <- feature_names
+  
+  return(list(importance = result_df, top_features = top_features_per_cluster))
+}
+
+result <- process_cluster_importance(importance_list)
+
+# Access the top features for each cluster
+top_features_per_cluster <- result$top_features
+
+unique_features <- unique(unlist(top_features_per_cluster))
+unique_features
+```
+
+Above, we generate a dataframe that contains importance scores for each of the features for each cluster. For each cluster, features with higher importance scores are informative in distinguishing that particular cluster from the others. We collate a set of around 20-25 features that consistently show up at least once in the top 10 highest-scoring features for any one cluster (through empirical runs of 20 random forests).
+
+Below, `feature_groups` represent this feature set, with similar ones grouped together for plotting purposes. **Disclaimer:** due to the stochastic nature of random forests, you may obtain a different feature set, but the set composition should be comparable across runs.
+
+```{r}
+feature_groups <- list(
+  "Time Features" = c("TimeSetUp", "TimePeakGather"),
+  
+  "Stride/Gait Metrics" = c("StrideLengthSetUp", "StrideLengthHeelStrike",
+                            "StrideLengthContact", 
+                            "StrideWidthSetUp", "StrideWidthContact"),
+  
+  "Knee Angles" = c("FrontKneeFlexionSetUp", "RearKneeFlexionSetUp",
+                    "RearKneeFlexionPeakGather", "RearKneeFlexionHeelStrike"),
+  
+  "Hip Positioning" = c("HipsXSetUp", "HipsXHeelStrike", "HipsXContact",
+                        "HipPlateDistContact"),
+  
+  "Hip-Shoulder Separation" = c("HSSeparationSetUp", "HSSeparationContact"),
+  
+  "Torso Bend and Rotation" = c("ForwardBendSetUp", "ForwardBendPeakGather",
+                                "ForwardBendHeelStrike", "ForwardBendContact",
+                                "TorsoRotationHeelStrike"), 
+  
+  "Spatial Positioning" = c("FrontZoneDepth", "BackZoneDepth"),
+  
+  "Bat Performance Metrics" = c("BatSpeedSSMax", "AttackAngleHorz", "AttackAngleVert"),
+  
+  "Body Measurements" = c("Height", "Weight"),
+  
+  "Outcomes" = c("ExitVelocity", "LaunchAngle", "LaunchDirection")
+)
+
+```
+
+We can use parallel coordinate plots to compare features grouped by categorical similarity. Synthesizing the plots allow for easier comparison between particular joints and biomechanical features, helping to develop and characterize the clusters.
+
+```{r}
+create_parallel_data_wide <- function(data, feature_groups) {
+  all_features <- unique(unlist(feature_groups))
+  valid_features <- intersect(all_features, colnames(data))
+  
+  result <- data.frame(Feature = valid_features, stringsAsFactors = FALSE)
+  
+  result$Group <- NA
+  for(group_name in names(feature_groups)) {
+    group_features <- intersect(feature_groups[[group_name]], colnames(data))
+    if(length(group_features) > 0) {
+      result$Group[result$Feature %in% group_features] <- group_name
+    }
+  }
+  
+  clusters <- sort(unique(data$MostFrequentCluster))
+  
+  for(cluster in clusters) {
+    cluster_data <- data[data$MostFrequentCluster == cluster, ]
+    
+    # Columns for median and IQR bounds
+    med_col <- paste0("Cluster", cluster)
+    lower_col <- paste0("Cluster", cluster, "_Lower")
+    upper_col <- paste0("Cluster", cluster, "_Upper")
+    
+    result[[med_col]] <- NA
+    result[[lower_col]] <- NA
+    result[[upper_col]] <- NA
+    
+    for(feature in valid_features) {
+      if(feature %in% colnames(cluster_data)) {
+        feature_values <- cluster_data[[feature]]
+        if(sum(!is.na(feature_values)) >= 4) {  # Need at least 4 values for meaningful quartiles
+          # Calculate median and quartiles
+          med_val <- median(feature_values, na.rm = TRUE)
+          q1 <- quantile(feature_values, 0.25, na.rm = TRUE)
+          q3 <- quantile(feature_values, 0.75, na.rm = TRUE)
+          
+          result[result$Feature == feature, med_col] <- med_val
+          result[result$Feature == feature, lower_col] <- q1
+          result[result$Feature == feature, upper_col] <- q3
+        } else if(sum(!is.na(feature_values)) > 0) {
+          # If fewer than 4 non-NA values, just use the median for all
+          med_val <- median(feature_values, na.rm = TRUE)
+          result[result$Feature == feature, med_col] <- med_val
+          result[result$Feature == feature, lower_col] <- med_val
+          result[result$Feature == feature, upper_col] <- med_val
+        }
+      }
+    }
+  }
+  
+  # NO standardization here - raw values are returned
+  return(result)
+}
+
+# Create the dataframe with raw (unstandardized) values
+parallel_data_wide <- create_parallel_data_wide(filtered_orig_condensed_model, feature_groups)
+
+create_group_plot <- function(group_name, features, data) {
+  
+  valid_features <- features[features %in% data$Feature]
+  group_data <- data[data$Feature %in% valid_features, ]
+  
+  med_cols <- grep("^Cluster[0-9]+$", colnames(group_data), value = TRUE)
+  line_data <- reshape2::melt(group_data[, c("Feature", "Group", med_cols)],
+                             id.vars = c("Feature", "Group"),
+                             measure.vars = med_cols,
+                             variable.name = "Cluster", 
+                             value.name = "Value")
+  
+  line_data$Cluster <- gsub("Cluster", "", line_data$Cluster)
+  
+  # IQR bands
+  ribbon_data <- data.frame()
+  clusters <- unique(line_data$Cluster)
+  
+  for(cluster in clusters) {
+    cluster_data <- line_data[line_data$Cluster == cluster, ]
+    lower_col <- paste0("Cluster", cluster, "_Lower")
+    upper_col <- paste0("Cluster", cluster, "_Upper")
+    
+    if(lower_col %in% colnames(group_data) && upper_col %in% colnames(group_data)) {
+      for(feature in valid_features) {
+        feature_row <- group_data[group_data$Feature == feature, ]
+        if(nrow(feature_row) > 0) {
+          lower_val <- feature_row[[lower_col]]
+          upper_val <- feature_row[[upper_col]]
+          
+          ribbon_data <- rbind(ribbon_data, data.frame(
+            Feature = feature,
+            Cluster = cluster,
+            Lower = lower_val,
+            Upper = upper_val
+          ))
+        }
+      }
+    }
+  }
+  
+  plot_data <- merge(line_data, ribbon_data, by = c("Feature", "Cluster"), all.x = TRUE)
+  
+  plot_data <- plot_data %>%
+    group_by(Feature) %>%
+    mutate(
+      # Calculate global min/max across all clusters for normalization
+      GlobalMin = min(c(Value, Lower, Upper), na.rm = TRUE),
+      GlobalMax = max(c(Value, Lower, Upper), na.rm = TRUE),
+      # Standardize all values using global min/max
+      NormValue = (Value - GlobalMin) / (GlobalMax - GlobalMin),
+      NormLower = (Lower - GlobalMin) / (GlobalMax - GlobalMin),
+      NormUpper = (Upper - GlobalMin) / (GlobalMax - GlobalMin)
+    ) %>%
+    ungroup()
+  
+  p <- ggplot(plot_data, aes(x = Feature, group = Cluster, color = Cluster, fill = Cluster)) +
+    geom_ribbon(aes(ymin = NormLower, ymax = NormUpper), alpha = 0.2, color = NA) +
+    geom_line(aes(y = NormValue), linewidth = 1) +
+    geom_point(aes(y = NormValue), size = 3) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 30, hjust = 1, size = 10),
+      plot.title = element_text(hjust = 0.5, size = 12, face = "bold")
+      # legend.position = "bottom"
+    ) +
+    ggtitle(group_name) +
+    xlab("") +
+    ylab("Normalized Value") +
+    scale_y_continuous(limits = c(0, 1)) +
+    scale_color_brewer(palette = "Set2") +
+    scale_fill_brewer(palette = "Set2")
+  
+  return(p)
+}
+```
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+
+# Collate plots into a list
+plot_list <- list()
+normalized_plot_data <- c()
+for(group_name in names(feature_groups)) {
+  p <- create_group_plot(group_name, feature_groups[[group_name]],                                          parallel_data_wide)
+  normalized_plot_data <- rbind(normalized_plot_data, p$data)
+  if(!is.null(p)) {
+    plot_list[[length(plot_list) + 1]] <- p
+  }
+}
+```
+
+This code chunk will output the parallel plots and save a PNG of it.
+
+```{r, fig.height = 11, fig.width = 8.5}
+#| message: false
+#| warning: false
+
+
+g <- arrangeGrob(grobs = plot_list, ncol = 3)
+grid.arrange(g)
+
+# ggsave("cluster_profiles.png", g, width = 19, height = 19, dpi = 300)
+```
+
+### Performance Outcome Distributions by Cluster
+
+To further understand differences between biomechanical swing clusters, we examined how **Hit Result** and **Swing Result** outcomes were distributed across batter groups. These plots display the proportion of each outcome within each cluster, allowing for meaningful comparison even if clusters differ in size.
+
+#### Hit Result Distribution
+
+```{r}
+
+cluster_colors <- c(
+  "1" = "#66c2a5",  # green
+  "2" = "#fc8d62",  # orange
+  "3" = "#8da0cb",  # blue
+  "4" = "#e78ac3"   # pink
+)
+
+# Compute proportions within each cluster
+hit_result_pct <- filtered_orig_condensed_full %>%
+  filter(!is.na(MostFrequentCluster), !is.na(HitResult)) %>%
+  count(MostFrequentCluster, HitResult) %>%
+  group_by(MostFrequentCluster) %>%
+  mutate(Proportion = n / sum(n)) %>%
+  ungroup()
+
+# Convert cluster to factor (important for color scale)
+hit_result_pct$MostFrequentCluster <- as.factor(hit_result_pct$MostFrequentCluster)
+
+# Plot
+hit_results <- ggplot(hit_result_pct, aes(x = HitResult, y = Proportion, fill = MostFrequentCluster)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), alpha = 0.7, color = "black") +
+  scale_fill_manual(values = cluster_colors, name = "Cluster") +
+  labs(
+    title = "Proportion of Hit Results by Batter Cluster",
+    x = "Hit Result",
+    y = "Proportion"
+  ) +
+  theme_minimal(base_size = 14)
+
+hit_results
+
+
+```
+
+#### Swing Result Distribution
+
+```{r}
+
+
+# Compute proportions within each cluster
+swing_result_pct <- filtered_orig_condensed_full %>%
+  filter(!is.na(MostFrequentCluster), !is.na(SwingResult)) %>%
+  count(MostFrequentCluster, SwingResult) %>%
+  group_by(MostFrequentCluster) %>%
+  mutate(Proportion = n / sum(n)) %>%
+  ungroup()
+
+# Convert cluster to factor
+swing_result_pct$MostFrequentCluster <- as.factor(swing_result_pct$MostFrequentCluster)
+
+# Plot
+swing_results <- ggplot(swing_result_pct, aes(x = SwingResult, y = Proportion, fill = MostFrequentCluster)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), alpha = 0.7, color = "black")+
+  scale_fill_manual(values = cluster_colors, name = "Cluster") +
+  labs(
+    title = "Proportion of Swing Outcomes by Batter Cluster",
+    x = "Swing Result",
+    y = "Proportion"
+  ) +
+  theme_minimal(base_size = 14)
+
+swing_results
+
+
+```
+
+### Random Forest Misclassification
+
+To evaluate how well biomechanical summary features could predict cluster assignments, we trained random forest classifiers on two datasets: (1) the representative set of highly consistent batters, and (2) all 100 batters in the sample.
+
+```{r}
+
+## -- ON REPRESENTATIVE SET --
+
+set.seed(1)
+
+# Train Random Forest
+rf_final <- randomForest(
+  MostFrequentCluster ~ . -BatterLabel,
+  data = filtered_orig_condensed_model,
+  importance = TRUE
+)
+
+print(rf_final)
+
+misclassification_rate <- rf_final$err.rate[nrow(rf_final$err.rate), "OOB"]
+cat("Misclassification Rate (OOB Error):", round(misclassification_rate, 4), "\n")
+
+# 0.2549
+
+### -- ON ALL 100 BATTERS --
+
+# Prepare the full dataset:
+# (Make sure BatterLabel is numeric if needed)
+orig_condensed$BatterLabel <- as.character(orig_condensed$BatterLabel)
+
+# Merge cluster labels for ALL batters
+full_orig_condensed_model <- orig_condensed %>%
+  left_join(batter_cluster_summary %>% dplyr::select(BatterLabel, Most_Frequent_Cluster), by = "BatterLabel") %>%
+  dplyr::select(-VBALaunch, -LaunchPosition, -BatContactLocation,
+                -SwingNumber, -BatterHandedness, -SwingResult,
+                -HitResult, -PitchInfoPitchGroup) %>%
+  group_by(BatterLabel) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
+  arrange(BatterLabel)
+
+# Rename Most_Frequent_Cluster
+full_orig_condensed_model$Most_Frequent_Cluster <- as.factor(full_orig_condensed_model$Most_Frequent_Cluster)
+
+# Fit Random Forest on all 100 batters
+rf_all <- randomForest(
+  Most_Frequent_Cluster ~ . -BatterLabel,
+  data = full_orig_condensed_model,
+  importance = TRUE
+)
+
+# Print model summary
+print(rf_all)
+
+# Extract misclassification rate (OOB error)
+misclassification_rate_all <- rf_all$err.rate[nrow(rf_all$err.rate), "OOB"]
+cat("Misclassification Rate (OOB Error) on All Batters:", round(misclassification_rate_all, 4), "\n")
+
+# 0.33
+```
+
+#### Performance on the Representative Set
+
+A random forest model was trained on the representative batters who had at least 85% of their swings assigned to a single cluster.
+
+-   The model achieved an **out-of-bag (OOB) error rate of 25.5%**, indicating reasonable classification accuracy.
+
+-   The confusion matrix showed that Cluster 1 batters were classified perfectly, while Clusters 2, 3, and 4 experienced moderate misclassification rates, primarily between Clusters 2 and 3.
+
+#### Performance on All 100 Batters
+
+We repeated the process using all batters in the dataset, including those with less consistent swing clusterings.
+
+-   The random forest model achieved an **OOB error rate of 33%** on this broader set.
+
+-   The confusion matrix revealed greater misclassification, particularly in Cluster 2, which had a class error rate above 50%.
+
+Overall, the classification performance suggests that the representative batters exhibit clearer biomechanical distinctions, but the full population model only performs slightly worse.
+
+## Prediction
+
+### Use Random Forest to Predict New Data
+
+Once a random forest model is fit, it can be used to predict cluster classifications on new data. We wrote some code to do this given the new data. This study did not involve a test set, so it loads in the data used to train the model by default; therefore, these results are not of interest until the data is replaced with data that was actually not used to train the model.
+
+Also note that, as an unsupervised process, cluster classification predictions made via this model cannot be validated.
+
+```{r}
+# Load in new data
+# Change data here
+new_data <- arrow::read_parquet(outcomes_path)
+
+# Make a modeling version WITHOUT HitResult and SwingResult
+new_batters <- new_data %>%
+  dplyr::select(-VBALaunch, -LaunchPosition, -BatContactLocation,
+                -SwingNumber, -BatterHandedness, -PitchInfoPitchGroup,
+                -HitResult, -SwingResult) %>%
+  group_by(BatterLabel) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
+  arrange(BatterLabel)
+
+# Generate and save model predictions
+new_predictions <- predict(rf_all, newdata = new_batters)
+
+# Display cluster assignments
+new_predictions
+```
